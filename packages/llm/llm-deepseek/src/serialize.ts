@@ -60,11 +60,16 @@ function flattenText(blocks: ContentBlock[]): string {
     .join('')
 }
 
-/** Reject core image content before any text-flattening path can silently erase it. */
-function assertTextOnly(blocks: readonly ContentBlock[]): void {
-  if (contentHasImage(blocks)) {
-    throw new LlmError('The DeepSeek chat-completions adapter does not support image content.', 'UNSUPPORTED_CONTENT')
-  }
+/** Convert image blocks to text placeholders so text-only adapters can relay them. */
+function imagePlaceholderText(blocks: readonly ContentBlock[]): string {
+  return blocks
+    .filter(block => block.type === 'image')
+    .map((block) => {
+      const ref = block.attachment
+      const label = ref.name ?? 'unnamed'
+      return `[Image: ${ref.attachmentId} | ${ref.mediaType} | ${ref.width}x${ref.height} | ${label}]`
+    })
+    .join('\n')
 }
 
 /** Serialize one assistant message (text + reasoning + tool calls). */
@@ -111,8 +116,19 @@ function serializeAssistant(message: Message): WireMessage {
  */
 export function serializeMessages(messages: Message[]): WireMessage[] {
   const wire: WireMessage[] = []
-  for (const message of messages) {
-    assertTextOnly(message.content)
+  for (const msg of messages) {
+    let message = msg
+    if (contentHasImage(message.content)) {
+      // Convert image blocks to text placeholders instead of rejecting.
+      // The api-proxy normally does this before the adapter sees the
+      // message; this is defense in depth for any other code path.
+      const placeholderText = imagePlaceholderText(message.content)
+      const textBlocks = message.content.filter(block => block.type !== 'image')
+      if (placeholderText.length > 0) {
+        textBlocks.push({ type: 'text', text: placeholderText })
+      }
+      message = { ...message, content: textBlocks }
+    }
     if (message.role === 'system') {
       wire.push({ role: 'system', content: flattenText(message.content) })
       continue

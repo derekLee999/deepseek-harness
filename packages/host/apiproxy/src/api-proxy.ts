@@ -187,6 +187,30 @@ async function durablePromptContent(ctx: Context, content: readonly PromptConten
   return blocks
 }
 
+/**
+ * Convert image blocks to text placeholders. The placeholder includes the
+ * attachment id so the model can locate the file on disk and run a vision
+ * bridge like ModLens. When `supportsImages` is true, blocks are returned
+ * unchanged.
+ */
+function withImagePlaceholders(
+  blocks: ContentBlock[],
+  supportsImages: boolean,
+): ContentBlock[] {
+  if (supportsImages) return blocks
+  const imageBlocks = blocks.filter(block => block.type === 'image')
+  if (imageBlocks.length === 0) return blocks
+  return blocks.map((block) => {
+    if (block.type !== 'image') return block
+    const ref = block.attachment
+    const label = ref.name ?? 'unnamed'
+    return {
+      type: 'text' as const,
+      text: `[Image: ${ref.attachmentId} | ${ref.mediaType} | ${ref.width}x${ref.height} | ${label}]\n`,
+    }
+  })
+}
+
 /** Search durable content for an image reference, including nested tool results. */
 function imageBlockIn(content: unknown, match: (ref: ImageAttachmentRef) => boolean): ImageAttachmentRef | undefined {
   if (!Array.isArray(content)) return undefined
@@ -2482,19 +2506,23 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         const hasImage = content.some(part => part.type === 'image')
         const admit = async (): Promise<RpcResponse<{ accepted: true }>> => {
           try {
+            const durable = await durablePromptContent(ctx, content)
+            let modelSupportsImages = true
             if (hasImage) {
-              const current = selectionFor(agent).current
-              const modelInfo = await ctx.llm.resolveModelInfo(current.provider, current.model)
-              if (modelInfo.inputModalities !== undefined && !modelInfo.inputModalities.includes('image')) {
-                return err(request, {
-                  code: 'attachment-error',
-                  message: `Model "${current.model}" does not support image input.`,
-                  details: { reason: 'MODEL_DOES_NOT_SUPPORT_IMAGES' },
-                })
+              try {
+                const current = selectionFor(agent).current
+                const modelInfo = await ctx.llm.resolveModelInfo(current.provider, current.model)
+                if (modelInfo.inputModalities !== undefined && !modelInfo.inputModalities.includes('image')) {
+                  modelSupportsImages = false
+                }
+              } catch {
+                // Treat unknown providers as text-only: the placeholder
+                // path is always safe and the image is still stored.
+                modelSupportsImages = false
               }
             }
-            const durable = await durablePromptContent(ctx, content)
-            const message: UserMessage = createUserMessage({ content: durable, source })
+            const modelBlocks = withImagePlaceholders(durable, modelSupportsImages)
+            const message: UserMessage = createUserMessage({ content: modelBlocks, source })
             if (mode === 'steer') agent.steer(message)
             else agent.followup(message)
           } catch (error: unknown) {
