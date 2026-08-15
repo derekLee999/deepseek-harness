@@ -156,6 +156,14 @@ class TestPersistence extends SessionPersistence {
     return { meta: whole.meta, events: whole.events.filter(event => event.seq >= fromSeq) }
   }
 
+  async delete(id: SessionIdType): Promise<void> {
+    if (!TestPersistence.entries.delete(id)) throw new Error('missing test session')
+    TestPersistence.revisions.delete(id)
+    TestPersistence.loads.delete(id)
+    TestPersistence.inspections.delete(id)
+    this.ctx.emit('session-persistence/deleted', id)
+  }
+
   async list(): Promise<SessionHeader[]> {
     TestPersistence.listStarted?.()
     await TestPersistence.listGate

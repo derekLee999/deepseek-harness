@@ -22,6 +22,10 @@ npx @deepseek-ai/dsh web
 
 该命令会启动 Web UI，默认地址为 `http://127.0.0.1:3080`。详见 [Web UI 指南](docs/user/guide/index.md)。
 
+### 以桌面应用运行
+
+在仓库检出版本中，`pnpm run desktop` 会先构建，再在 Electron 窗口中打开同一个 Web UI。关闭窗口会把它隐藏到系统托盘（托盘 Quit 菜单项停止服务器）；[桌面壳](apps/desktop/README.md)监督的是浏览器同样会连接的 `dsh web` 服务器。
+
 ### 从源码运行
 
 如需从仓库源码运行：

@@ -5,12 +5,14 @@
 // trip over the real wire (workspace.rename RPC + durable registry), the
 // duplicate-name pre-check, the
 // flat "In one list" view with its persisted group-by preference, the session
-// hover card and row action menu, and the session archive round trip (row
+// hover card and row action menu, the session archive round trip (row
 // menu → workspace.archiveSession RPC → durable global set → row hidden
-// across reload). Zero model calls: workspace.create/rename/archiveSession
-// are host RPCs with no model involvement, and the one session row the
-// flat/hover/menu/archive scenarios need comes from a seeded fixture (the
-// seeded-history seed reused verbatim — no new recording).
+// across reload), and the session delete round trip (row menu → confirm
+// dialog → workspace.deleteSession RPC → local log gone → row hidden across
+// reload). Zero model calls: workspace.create/rename/archiveSession/
+// deleteSession are host RPCs with no model involvement, and the one session
+// row the flat/hover/menu/archive scenarios need comes from a seeded fixture
+// (the seeded-history seed reused verbatim — no new recording).
 import { mkdir, readFile, stat, writeFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { join, sep } from 'node:path'
@@ -595,6 +597,131 @@ describe('web e2e: workspace management (create / rename / flat view / hover aff
     expect(await page.getByText(rowTitle, { exact: true }).count()).toBe(0)
     expect(tripwire.pageErrors).toEqual([])
   }, 90_000)
+
+  it('deletes a session from its row menu, removing its local log durably across reload', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-ws-delete-session'))
+    const deleteSeedId = 'workspace-management-delete-e2e'
+    // The archive scenario consumed the shared seeded row (and hid it), so
+    // seed a second cold session specifically for the destructive flow. The
+    // JSONL backend discovers it on its next directory scan; reload rebuilds
+    // the client baseline around it.
+    await seedSession(scaffold, await readFile(SEED, 'utf8'), deleteSeedId)
+    const warningStart = tripwire.warnings.length
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    acknowledgeReloadConnectionLoss(tripwire, warningStart)
+    await expect.poll(() => page.getByText('Workspaces', { exact: true }).count(), { timeout: 15_000 }).toBe(1)
+    const ungroupedRow = page.getByText('Ungrouped', { exact: true }).locator('..').locator('..')
+    const ungroupedSection = ungroupedRow.locator('..')
+    await expect.poll(async () => {
+      if (await ungroupedRow.getAttribute('aria-expanded') !== 'true') {
+        await page.getByText('Ungrouped', { exact: true }).click()
+        await page.waitForTimeout(50)
+      }
+      return await ungroupedRow.getAttribute('aria-expanded')
+    }, { timeout: 5_000 }).toBe('true')
+    const sessionRows = ungroupedSection.locator('[role="treeitem"]')
+      .filter({ has: page.locator('button[aria-label^="Session actions for "]') })
+    await expect.poll(() => sessionRows.count(), { timeout: 10_000 }).toBe(1)
+    const sessionRow = sessionRows.first()
+    const rowTitle = await sessionRow.locator('[class*="title"]').innerText()
+
+    // Row menu → destructive action: a confirmation dialog states the
+    // permanence before anything reaches the wire.
+    await clickHoverAction(sessionRow, `Session actions for ${rowTitle}`)
+    await page.getByRole('menuitem', { name: 'Delete session' }).click()
+    const dialog = page.getByRole('dialog', { name: 'Delete session' })
+    await dialog.waitFor({ timeout: 10_000 })
+    expect(await dialog.textContent()).toContain('permanently deletes')
+    expect((await scaffold.ctx.sessionPersistence.list()).map(header => header.id))
+      .toContain(SessionId(deleteSeedId))
+    await dialog.getByRole('button', { name: 'Delete session' }).click()
+    // The row disappears on the removal frame; with no other visible stray,
+    // the whole Ungrouped bucket withdraws.
+    await expect.poll(() => page.getByText(rowTitle, { exact: true }).count(), { timeout: 10_000 }).toBe(0)
+    await expect.poll(() => page.getByText('Ungrouped', { exact: true }).count(), { timeout: 10_000 }).toBe(0)
+    // The local artifact is gone for good: not listed, not readable, and the
+    // id stays absent from every workspace account and the archive set.
+    await expect.poll(
+      () => scaffold.ctx.sessionPersistence.list().then(headers => headers.map(header => header.id)),
+      { timeout: 10_000 },
+    ).not.toContain(SessionId(deleteSeedId))
+    expect(await scaffold.ctx.sessionPersistence.readRaw(SessionId(deleteSeedId))).toBeUndefined()
+    expect(scaffold.ctx.workspaceRegistry.list().flatMap(workspace => [...workspace.sessionIds]))
+      .not.toContain(SessionId(deleteSeedId))
+    expect([...scaffold.ctx.workspaceRegistry.archivedSessionIds]).not.toContain(SessionId(deleteSeedId))
+
+    // Reload: the removal is durable — the row never resurfaces.
+    const reloadStart = tripwire.warnings.length
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    acknowledgeReloadConnectionLoss(tripwire, reloadStart)
+    await expect.poll(() => page.getByText('Workspaces', { exact: true }).count(), { timeout: 15_000 }).toBe(1)
+    expect(await page.getByText(rowTitle, { exact: true }).count()).toBe(0)
+    expect((await scaffold.ctx.sessionPersistence.list()).map(header => header.id))
+      .not.toContain(SessionId(deleteSeedId))
+    expect(tripwire.pageErrors).toEqual([])
+  }, 120_000)
+
+  it('deletes an opened (live) session through the same row menu path', async () => {
+    onTestFailed(() => saveFailureShot(page, 'web-e2e-ws-delete-opened'))
+    const openedSeedId = 'workspace-management-opened-delete-e2e'
+    await seedSession(scaffold, await readFile(SEED, 'utf8'), openedSeedId)
+    const warningStart = tripwire.warnings.length
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    acknowledgeReloadConnectionLoss(tripwire, warningStart)
+    await expect.poll(() => page.getByText('Workspaces', { exact: true }).count(), { timeout: 15_000 }).toBe(1)
+    const ungroupedRow = page.getByText('Ungrouped', { exact: true }).locator('..').locator('..')
+    const ungroupedSection = ungroupedRow.locator('..')
+    const sessionRows = ungroupedSection.locator('[role="treeitem"]')
+      .filter({ has: page.locator('button[aria-label^="Session actions for "]') })
+    await expect.poll(() => sessionRows.count(), { timeout: 10_000 }).toBe(1)
+    const sessionRow = sessionRows.first()
+
+    // Open the conversation: the host attaches its Agent and the session
+    // becomes live — the exact state the earlier cold-delete flow never
+    // reached and that must stay deletable.
+    await sessionRow.locator('[class*="title"]').click()
+    await expect.poll(
+      () => scaffold.ctx.agents.get(SessionId(openedSeedId)) !== undefined,
+      { timeout: 15_000 },
+    ).toBe(true)
+
+    // Row menu → confirmation → teardown + durable removal while it is open.
+    // Opening the conversation collapses the sidebar into the rail, where
+    // session rows do not render; expand it again and re-locate the row (the
+    // pre-open handle is stale after the re-render anyway, and the live
+    // title fold may differ from the cold one).
+    const openSidebar = page.getByRole('button', { name: 'Open sidebar' })
+    if (await openSidebar.count() > 0) await openSidebar.click()
+    const liveRows = ungroupedSection.locator('[role="treeitem"]')
+      .filter({ has: page.locator('button[aria-label^="Session actions for "]') })
+    await expect.poll(() => liveRows.count(), { timeout: 10_000 }).toBe(1)
+    const liveRow = liveRows.first()
+    const liveTitle = await liveRow.locator('[class*="title"]').innerText()
+    await clickHoverAction(liveRow, `Session actions for ${liveTitle}`)
+    await page.getByRole('menuitem', { name: 'Delete session' }).click()
+    const dialog = page.getByRole('dialog', { name: 'Delete session' })
+    await dialog.waitFor({ timeout: 10_000 })
+    await dialog.getByRole('button', { name: 'Delete session' }).click()
+    await expect.poll(() => page.getByText(liveTitle, { exact: true }).count(), { timeout: 10_000 }).toBe(0)
+    await expect.poll(() => page.getByText('Ungrouped', { exact: true }).count(), { timeout: 10_000 }).toBe(0)
+    await expect.poll(
+      () => scaffold.ctx.sessionPersistence.list().then(headers => headers.map(header => header.id)),
+      { timeout: 10_000 },
+    ).not.toContain(SessionId(openedSeedId))
+    expect(scaffold.ctx.agents.get(SessionId(openedSeedId))).toBeUndefined()
+
+    // Reload: still gone (the removal was durable, not just visual).
+    const reloadStart = tripwire.warnings.length
+    await page.reload({ waitUntil: 'load' })
+    await page.waitForSelector('[class*="frame"]', { timeout: 30_000 })
+    acknowledgeReloadConnectionLoss(tripwire, reloadStart)
+    await expect.poll(() => page.getByText('Workspaces', { exact: true }).count(), { timeout: 15_000 }).toBe(1)
+    expect(await page.getByText(liveTitle, { exact: true }).count()).toBe(0)
+    expect(tripwire.pageErrors).toEqual([])
+  }, 120_000)
 
   it('opens folders with identical basenames as distinct workspaces', async () => {
     onTestFailed(() => saveFailureShot(page, 'web-e2e-ws-duplicate-basename'))

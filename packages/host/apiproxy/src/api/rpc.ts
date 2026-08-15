@@ -33,6 +33,12 @@ export interface RpcErrorDetailsMap {
   'bad-request': { issues: ZodIssue[] }
   'cancelled': {}
   'session-not-found': { sessionId: SessionId }
+  /** Session deletion was refused: live or persisted child sessions (fork/subagent lineage) still exist. */
+  'session-has-descendants': { sessionId: SessionId; children: SessionId[] }
+  /** Session deletion was refused: the session is live but the gateway holds no teardown for it. */
+  'session-busy': { sessionId: SessionId }
+  /** Session deletion was refused: the live session's turn is running (wait or cancel first). */
+  'session-running': { sessionId: SessionId }
   'model-unavailable': { provider: string; model: string }
   'session-conflict': { sessionId: SessionId; requestedCwd: string; existingCwd?: string }
   'invalid-time-zone': { value: string }

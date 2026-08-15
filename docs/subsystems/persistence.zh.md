@@ -360,6 +360,17 @@ abstract inspect(id: SessionId, signal?: AbortSignal): Promise<SessionInspection
 abstract readFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ meta: SessionHeader; events: SessionEvent[] }>
 
 /**
+ * Permanently delete one session's stored log. Queued on the per-id write
+ * chain (serialized with in-flight appends). An unknown id rejects; an
+ * un-materialized create intent is cancelled and resolves; a live or
+ * reserved session rejects (callers tear the session down first). After a
+ * successful deletion the id behaves as unknown for every subsequent
+ * operation, and `'session-persistence/deleted'` is emitted.
+ * @param id - the persisted session to delete.
+ */
+abstract delete(id: SessionId): Promise<void>
+
+/**
  * Lightweight listing from metadata, without a full-log parse.
  * @param signal - optional cancellation for backend listing work.
  * @returns one header per materialized session.
@@ -381,5 +392,32 @@ abstract listSnapshots(signal?: AbortSignal): Promise<SessionPersistenceSnapshot
 
 Types: [SessionEvent](session.md) · [SessionId](core.md)
 
-Source: [`packages/session/session-persistence/src/index.ts:84`](../../packages/session/session-persistence/src/index.ts)
+Source: [`packages/session/session-persistence/src/index.ts:97`](../../packages/session/session-persistence/src/index.ts)
+
+<a id="session-persistence-events"></a>
+
+### `session-persistence/*` events
+
+<a id="session-persistencedeleted--emit"></a>
+
+#### `session-persistence/deleted` — emit
+
+One session's stored log was permanently deleted, emitted strictly after the backend removed the durable artifact (or cancelled the un-materialized create intent). Derived data stores holding per-session projections subscribe and drop their rows; the id behaves as unknown to session persistence afterwards.
+
+```ts cordis-catalog
+/**
+ * One session's stored log was permanently deleted, emitted strictly after
+ * the backend removed the durable artifact (or cancelled the
+ * un-materialized create intent). Derived data stores holding per-session
+ * projections subscribe and drop their rows; the id behaves as unknown to
+ * session persistence afterwards.
+ * @param id - the deleted session id.
+ * @mode emit
+ */
+'session-persistence/deleted'(id: SessionId): void
+```
+
+Types: [SessionId](core.md)
+
+Source: [`packages/session/session-persistence/src/index.ts:75`](../../packages/session/session-persistence/src/index.ts)
 <!-- END GENERATED cordis-surface -->

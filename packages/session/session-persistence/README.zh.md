@@ -21,6 +21,7 @@
 | `readFrom(id, fromSeq, signal?): Promise<{ meta; events }>` | 返回 `seq >= fromSeq` 的有效已存储事件，不进入 preparation 缓存、不截断、不合成 closer，也不发布协调器状态。`fromSeq` 达到或超过已存储末尾时返回空事件列表；负数或非安全整数 `fromSeq` 会被拒绝。可寻址后端（SQLite）只读后缀，除非转换受支持的旧记录需要读取更早的记录；顺序后端（JSONL）解析整个产物并向前跳过。未知类型拒绝遵循同一读取方式：寻址读取只检查返回的后缀，顺序回退路径还会拒绝窗口以下的未知必需事件。供 checkpoint 消费方只应用已存序号之后的事件。 |
 | `list(signal?): Promise<SessionHeader[]>` | 从元数据轻量列出，不解析完整日志。可选信号取消后端列表工作。零事件延迟实体化会话不在 `list` 中。 |
 | `listSnapshots(signal?): Promise<SessionPersistenceSnapshot[]>` | 返回轻量元数据和每份日志一个不透明、带品牌类型的修订值，不加载事件日志。日志及其后端存储不变时，修订保持相等；append 或变更性 load 修复后会改变；不会仅因两个存储使用相同本地计数器而冲突。可选信号请求取消后端发现工作；第一方后端会先等待所有已启动的列出工作结束，再予以拒绝，因此调用返回拒绝时，相关工作已完全停稳。 |
+| `delete(id): Promise<void>` | 永久删除一个会话的存储日志。在 per-id 写链上排队，因此与在途 append 串行化，并先等待已销毁活动会话的最终排水完成。未知 id 拒绝；未实体化的 create 意图被取消并正常返回；活动或被预留的会话拒绝（调用方需先拆除会话）。成功后该 id 对后续每个操作都表现为未知，且协调器严格在持久删除完成后发出 `'session-persistence/deleted'(id)`——这是派生存储投影与主机移除帧使用的已通知提交点（见[会话删除决策](../../../.agents/notes/implemented/feature/2026-08-15-session-deletion.md)）。 |
 
 ## 每个后端必须遵守的不变量
 
@@ -53,6 +54,7 @@
 | `loadStoredFrom?(id, fromSeq, signal?)` | 服务 `readFrom` 背后的可选可寻址后缀读取：返回 header 和 `seq >= fromSeq` 的已存储事件，非修改式、无撕裂标记。SQLite 实现它（`WHERE seq >= ?`）；不实现的后端使用协调器回退——`loadStored` 加向前跳过。 |
 | `appendBatch(meta, events, isMaterialized)` | 持久追加连续批次；尚未实体化时以原子方式延迟实体化。 |
 | `commitRepair(meta, tornMarker, closers)` | 使崩溃修复持久：截断撕裂尾部（当且仅当 `tornMarker !== undefined`；标记可为 falsy，例如 seq/offset `0`），并追加 `closers`。不要求原子性。由 load（截断 + closer）和活动会话接管（仅截断）使用。 |
+| `deleteStored(id)` | 删除一个 id 的所有持久产物（JSONL 的两个物理编码文件，跨全部存储范围；SQLite 在一个事务中删除 `events` + `sessions` 行）。幂等——在没有内容时正常返回也是合法的；协调器只在确认 id 存在后调用它，崩溃重跑收敛也依赖这一幂等性。 |
 | `list(signal?)` | 列出全部已存储元数据，并遵循可选的取消信号。 |
 | `close?()` | 可选生命周期拆卸（例如关闭 db 句柄），在 dispose drain 后等待其完成。 |
 

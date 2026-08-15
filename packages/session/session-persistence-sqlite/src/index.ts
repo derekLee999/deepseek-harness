@@ -198,6 +198,10 @@ export class SqliteSessionPersistence extends SessionPersistence implements Pers
     return this.coordinator.readFrom(id, fromSeq, signal)
   }
 
+  delete(id: SessionId): Promise<void> {
+    return this.coordinator.delete(id)
+  }
+
   // One method serves both public `list` and the backend hook; delegating it to
   // the coordinator would call this hook recursively.
 
@@ -334,6 +338,27 @@ export class SqliteSessionPersistence extends SessionPersistence implements Pers
       this.db.exec('ROLLBACK')
       throw error
       /* v8 ignore stop */
+    }
+  }
+
+  /**
+   * Delete one session's rows in ONE transaction (`events`, then the `sessions`
+   * identity row). Idempotent: deleting absent rows is a valid no-op — the
+   * coordinator only calls this after establishing the id is known, and a
+   * crash-rerun deletes nothing on its second pass.
+   * @param id - persisted session id whose rows are deleted.
+   */
+  async deleteStored(id: SessionId): Promise<void> {
+    await this.ready
+    this.db.exec('BEGIN')
+    try {
+      this.db.prepare('DELETE FROM events WHERE session_id = ?').run(id)
+      this.db.prepare('DELETE FROM sessions WHERE id = ?').run(id)
+      this.db.exec('COMMIT')
+    } catch (error) {
+      /* v8 ignore next -- BEGIN failure has no transaction to roll back; the wrapper still reports it. */
+      this.db.exec('ROLLBACK')
+      throw error
     }
   }
 

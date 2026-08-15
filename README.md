@@ -22,6 +22,10 @@ npx @deepseek-ai/dsh web
 
 The command starts the Web UI, served at `http://127.0.0.1:3080` by default. See [Web UI guide](docs/user/guide/index.md).
 
+### Run as a desktop app
+
+From a repository checkout, `pnpm run desktop` builds and opens the same Web UI in an Electron window. Closing the window hides it to the system tray (the tray's Quit item stops the server); the [desktop shell](apps/desktop/README.md) supervises the same `dsh web` server a browser would connect to.
+
 ### Run from source
 
 To run from a repository checkout:

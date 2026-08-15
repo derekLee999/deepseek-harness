@@ -8,7 +8,7 @@ import { mkdir, stat } from 'node:fs/promises'
 import { dirname } from 'node:path'
 import type { Context } from '@deepseek-ai/cordis'
 import { installModelSelection } from '@deepseek-ai/dsh-agent'
-import type { Agent, ModelSelection, ModelSelectionRef, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
+import type { Agent, AgentHandle, ModelSelection, ModelSelectionRef, AgentOptions, AgentStatus } from '@deepseek-ai/dsh-agent'
 import type {} from '@deepseek-ai/dsh-agent-presets/types'
 import { AttachmentError } from '@deepseek-ai/dsh-attachment'
 import type { ImageAttachmentRef } from '@deepseek-ai/dsh-attachment'
@@ -1087,6 +1087,73 @@ class WorkspaceNameConflictError extends Error {
   }
 }
 
+/** workspace.deleteSession named a session neither live nor in session persistence. */
+class SessionDeleteUnknownError extends Error {
+  constructor(readonly sessionId: SessionId) {
+    super(`cannot delete session '${sessionId}': live sessions and session persistence hold no such session`)
+    this.name = 'SessionDeleteUnknownError'
+  }
+}
+
+/** workspace.deleteSession named the parent of live or persisted descendants (leaves only are deletable). */
+class SessionDeleteHasDescendantsError extends Error {
+  constructor(readonly sessionId: SessionId, readonly children: readonly SessionId[]) {
+    super(
+      `cannot delete session '${sessionId}': its forked or subagent child sessions still exist `
+      + `(${children.map(child => `'${child}'`).join(', ')})`,
+    )
+    this.name = 'SessionDeleteHasDescendantsError'
+  }
+}
+
+/** workspace.deleteSession named a live session this gateway cannot tear down (activation-owned, or created outside the gateway). */
+class SessionDeleteBusyError extends Error {
+  constructor(readonly sessionId: SessionId) {
+    super(
+      `cannot delete session '${sessionId}': it is live but this gateway holds no teardown for it `
+      + '(subagent-owned or created outside the gateway)',
+    )
+    this.name = 'SessionDeleteBusyError'
+  }
+}
+
+/** workspace.deleteSession named a live session whose turn is running (wait for it or cancel first). */
+class SessionDeleteRunningError extends Error {
+  constructor(readonly sessionId: SessionId) {
+    super(
+      `cannot delete session '${sessionId}': it is running a task; `
+      + 'wait for the turn to finish or cancel it first',
+    )
+    this.name = 'SessionDeleteRunningError'
+  }
+}
+
+/**
+ * Teardown capabilities of gateway-created/resumed agents, keyed by session id
+ * and rooted per application context. Module-level (the dsh-mcp-client
+ * root-keyed reservation pattern): the gateway plugin hot-reloads while its
+ * agents — whose lifecycle effects live on the root fiber — keep running, so
+ * the store must outlive one gateway generation; a store local to the plugin
+ * would strand every pre-reload live session as undeletable (the gateway then
+ * holds no handle for an agent it still owns).
+ */
+const sessionHandlesByRoot = new WeakMap<Context, Map<SessionId, AgentHandle>>()
+
+/**
+ * Resolve this application's teardown store, created once per root context.
+ * Exported for the same-package HMR-survival spec.
+ * @param ctx - any context of the application; its root keys the store.
+ * @returns the shared per-root session-teardown store.
+ */
+export function sessionHandleStore(ctx: Context): Map<SessionId, AgentHandle> {
+  let store = sessionHandlesByRoot.get(ctx.root)
+  if (store === undefined) {
+    store = new Map()
+    sessionHandlesByRoot.set(ctx.root, store)
+  }
+  return store
+}
+
 /** Shared workspace-not-found error response of the workspace.* mutation rows. */
 function workspaceNotFound<T>(request: RpcRequest<unknown>, workspaceId: string): RpcResponse<T> {
   return err(request, {
@@ -1149,6 +1216,22 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
   const presetSwitches = new Map<SessionId, Promise<unknown>>()
   /** Client-chosen identity creation/resume, deduplicated across concurrent retries. */
   const sessionCreations = new Map<SessionId, Promise<Agent>>()
+  /**
+   * Teardown capability of every gateway-created (or gateway-resumed) agent,
+   * keyed by session id in the root-context store (module-level: survives
+   * gateway hot reloads — see {@link sessionHandleStore}).
+   * `workspace.deleteSession` disposes the handle before deleting the stored
+   * log — the compose-cancel-then-delete orchestration rule. Activation-owned
+   * subagent sessions have no entry here and are refused upfront
+   * (`SessionDeleteBusyError`).
+   */
+  const sessionHandles = sessionHandleStore(ctx)
+  // Entries leave with their agents; the listener lives with this gateway
+  // generation while the store outlives it.
+  ctx.effect(
+    () => ctx.on('agent/disposed', ({ agent }) => { sessionHandles.delete(agent.id) }),
+    'api-proxy.sessionHandles',
+  )
   /** Serializes path ownership and explicit title checks with Workspace mutations. */
   let workspaceCreationChain = Promise.resolve()
   const pendingQuestions = new Map<RpcId, PendingQuestion>()
@@ -1292,6 +1375,10 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
     agentOptions,
     setup: async ({ meta, events }) =>
       (await composeAgent(resolveSessionPreset({ header: meta, events }))).setup,
+    // The resolver drops every resume handle; the gateway retains it in the
+    // root-keyed store so a session resumed through a generic entry point
+    // (prompt, models, …) stays deletable later.
+    onHandle: (sessionId, handle) => { sessionHandles.set(sessionId, handle) },
   })
 
   /** Send one transient frame to every connected mux consumer. */
@@ -1678,11 +1765,13 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           // session's history was produced under that composition, and
           // rebuilding it differently would replay tool calls the model can no
           // longer make.
-          return (await ctx.agents.resume({
+          const handle = await ctx.agents.resume({
             resumeSessionId: sessionId,
             agentOptions: agentOptions(),
             setup: (await composeAgent(storedPreset)).setup,
-          })).agent
+          })
+          sessionHandles.set(sessionId, handle)
+          return handle.agent
         }
 
         try {
@@ -1691,7 +1780,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           throw new Error(`failed to ensure project directory "${cwd}": ${String(error)}`, { cause: error })
         }
         const composition = await composeAgent(presetId)
-        return (await ctx.agents.create({
+        const handle = await ctx.agents.create({
           sessionId,
           agentOptions: agentOptions(),
           meta: {
@@ -1699,7 +1788,9 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             ...composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset },
           },
           setup: composition.setup,
-        })).agent
+        })
+        sessionHandles.set(sessionId, handle)
+        return handle.agent
       })().catch((error: unknown) => {
         // Another Host entry path may have published the same identity while
         // this operation crossed an asynchronous persistence/filesystem step.
@@ -1728,6 +1819,72 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
       throw new SessionCwdConflict(sessionId, cwd, agent.session.header.cwd)
     }
     return agent
+  }
+
+  /**
+   * The session-deletion orchestration behind `workspace.deleteSession`
+   * (composition of the settled persistence-layer rules):
+   *
+   * 1. Refuse activation-owned live sessions (the gateway holds no teardown
+   *    capability for them) and live sessions whose turn is running (the
+   *    caller waits or cancels first — deletion never kills a task).
+   * 2. Refuse unknown identities: a session neither live nor in session
+   *    persistence fails without writing.
+   * 3. Refuse parents: any live or persisted session whose header names this
+   *    id as `parentSession` blocks the delete (only leaves are deletable).
+   * 4. An idle live session is torn down through its retained AgentHandle —
+   *    the caller compositing cancel+dispose before deletion, never the
+   *    persistence layer reaching back into the runtime. The handle store is
+   *    root-keyed and survives gateway hot reloads (see
+   *    {@link sessionHandleStore}).
+   * 5. The stored log is deleted, then the registry prunes the workspace
+   *    account, the archive set, and its header indexes. Row removals reach
+   *    clients through `host/session-removed` and the registry change frames.
+   *
+   * Rerunning after a crash converges: a half-finished delete either names a
+   * now-unknown session (session-not-found) or re-prunes an already-clean
+   * registry (idempotent).
+   * @param sessionId - session to delete permanently.
+   */
+  async function deleteTargetSession(sessionId: SessionId): Promise<void> {
+    const liveSession = ctx.sessions.get(sessionId)
+    if (liveSession !== undefined) {
+      const liveAgent = ctx.agents.get(sessionId)
+      if (hasSubagentOwner(liveSession, liveAgent)) {
+        throw new SessionDeleteBusyError(sessionId)
+      }
+      if (liveAgent?.status === 'running') {
+        throw new SessionDeleteRunningError(sessionId)
+      }
+    }
+    const persistence = ctx.get('sessionPersistence')
+    /* v8 ignore next -- the gateway's WorkspaceRegistry injects sessionPersistence, so every composition
+       reaching this code mounts it */
+    if (persistence === undefined) throw new SessionDeleteUnknownError(sessionId)
+    const persistedHeaders = await persistence.list()
+    if (liveSession === undefined && !persistedHeaders.some(header => header.id === sessionId)) {
+      throw new SessionDeleteUnknownError(sessionId)
+    }
+
+    const children = new Map<SessionId, true>()
+    for (const live of ctx.sessions.list()) {
+      if (live.id !== sessionId && live.header.parentSession === sessionId) children.set(live.id, true)
+    }
+    for (const header of persistedHeaders) {
+      if (header.id !== sessionId && header.parentSession === sessionId) children.set(header.id, true)
+    }
+    if (children.size > 0) {
+      throw new SessionDeleteHasDescendantsError(sessionId, [...children.keys()])
+    }
+
+    if (liveSession !== undefined) {
+      const handle = sessionHandles.get(sessionId)
+      if (handle === undefined) throw new SessionDeleteBusyError(sessionId)
+      await handle.dispose()
+      sessionHandles.delete(sessionId)
+    }
+    await persistence.delete(sessionId)
+    await ctx.workspaceRegistry.deleteSession(sessionId)
   }
 
   /** Resolve or create one path while holding the Host's workspace-create chain. */
@@ -2444,7 +2601,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
         // plane, composing nothing would leave the child with no tools at all.
         const forkComposition = await composeAgent(resolveSessionPreset(source))
         try {
-          await ctx.agents.create({
+          const handle = await ctx.agents.create({
             sessionId: childId,
             seed: events.slice(0, cut),
             meta: {
@@ -2458,6 +2615,7 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
             agentOptions: agentOptions(),
             setup: forkComposition.setup,
           })
+          sessionHandles.set(childId, handle)
         } catch (error: unknown) {
           return err(request, {
             code: 'internal',
@@ -2945,6 +3103,45 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           })
         }
         return ok(request, { archivedSessionIds: [...ctx.workspaceRegistry.archivedSessionIds] })
+      },
+
+      async deleteSession(request) {
+        const { sessionId } = request.payload
+        try {
+          await deleteTargetSession(sessionId)
+        } catch (error: unknown) {
+          if (error instanceof SessionDeleteUnknownError) {
+            return err(request, {
+              code: 'session-not-found',
+              message: error.message,
+              details: { sessionId },
+            })
+          }
+          if (error instanceof SessionDeleteHasDescendantsError) {
+            return err(request, {
+              code: 'session-has-descendants',
+              message: error.message,
+              details: { sessionId, children: [...error.children] },
+            })
+          }
+          if (error instanceof SessionDeleteBusyError) {
+            return err(request, {
+              code: 'session-busy',
+              message: error.message,
+              details: { sessionId },
+            })
+          }
+          if (error instanceof SessionDeleteRunningError) {
+            return err(request, {
+              code: 'session-running',
+              message: error.message,
+              details: { sessionId },
+            })
+          }
+          // Storage, teardown, and registry faults propagate as internal errors.
+          throw error
+        }
+        return ok(request, { deleted: true as const })
       },
     },
 
@@ -3584,6 +3781,14 @@ export function createApiProxy(ctx: Context, defaults: ApiProxyDefaults): ApiPro
           }),
           ctx.on('session/disposed', (session: Session) => {
             queue.push(frame({ type: 'host/session-removed', sessionId: session.id }))
+          }),
+          // A stored log deleted while its session was never attached (a cold
+          // delete) has no disposal edge to frame — the persistence commit
+          // point is its removal notification. A live delete streams its
+          // removal from `session/disposed` and this pushes one idempotent
+          // duplicate; the client's removal handling tolerates repeats.
+          ctx.on('session-persistence/deleted', (sessionId: SessionId) => {
+            queue.push(frame({ type: 'host/session-removed', sessionId }))
           }),
           ctx.on('agent/status', ({ agent, status }: { agent: Agent; status: AgentStatus }) => {
             queue.push(frame({ type: 'host/session-status', sessionId: agent.id, running: status === 'running' }))

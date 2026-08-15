@@ -6,7 +6,7 @@ import { Context } from '@deepseek-ai/cordis'
 import AgentRegistry, { Inbox } from '@deepseek-ai/dsh-agent'
 import type { Agent, AgentFactory } from '@deepseek-ai/dsh-agent'
 import SessionStore, { SessionId } from '@deepseek-ai/dsh-session'
-import type { Session } from '@deepseek-ai/dsh-session'
+import type { Session, SessionEvent, SessionHeader } from '@deepseek-ai/dsh-session'
 import Storage from '@deepseek-ai/dsh-storage'
 import { DomainFacility } from '@deepseek-ai/dsh-storage-domain'
 import UserQuestionService from '@deepseek-ai/dsh-user-questions'
@@ -17,6 +17,7 @@ import type { HostFrame, WorkspaceId } from '@deepseek-ai/dsh-host-apiproxy/api'
 import type { RpcRequest, RpcResponse } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { RpcId } from '@deepseek-ai/dsh-host-apiproxy/api/rpc'
 import { createApiProxy } from '@deepseek-ai/dsh-host-apiproxy'
+import { sessionHandleStore } from '../src/api-proxy.ts'
 import { MemoryStorageBackend } from '../../../storage/storage-domain/tests/helpers/memory-backend.ts'
 
 let nextRpc = 1
@@ -64,6 +65,11 @@ async function harness(
   extras: {
     openPath?: (path: string, signal: AbortSignal) => Promise<void>
     canOpenPath?: () => boolean
+    sessionPersistence?: {
+      list: () => Promise<SessionHeader[]>
+      delete: (id: SessionId) => Promise<void>
+      inspect?: (id: SessionId) => Promise<{ meta: SessionHeader; events: SessionEvent[] }>
+    }
   } = {},
 ) {
   const ctx = new Context()
@@ -75,7 +81,22 @@ async function harness(
   const storageDomain = new DomainFacility(ctx, { backend: 'memory', routes: {} })
   ctx.storage.mount('domain', storageDomain)
   ctx.provide('storageDomain', storageDomain)
-  ctx.provide('sessionPersistence', { list: () => Promise.resolve([]) } as never)
+  const persistenceDouble = extras.sessionPersistence ?? {
+    list: () => Promise.resolve([]),
+    delete: async () => {},
+  }
+  ctx.provide('sessionPersistence', {
+    list: () => persistenceDouble.list(),
+    // Emitting the persistence commit event mirrors the real coordinator, so
+    // the gateway's host stream can frame cold deletions.
+    delete: async (id: SessionId) => {
+      await persistenceDouble.delete(id)
+      ctx.emit('session-persistence/deleted', id)
+    },
+    inspect: (id: SessionId) => persistenceDouble.inspect === undefined
+      ? Promise.reject(new Error(`test harness has no inspection for "${id}"`))
+      : persistenceDouble.inspect(id),
+  } as never)
   await ctx.plugin(WorkspaceRegistry)
 
   const factory: AgentFactory = {
@@ -94,8 +115,17 @@ async function harness(
         },
       }
     },
-    async resume() {
-      throw new Error('test harness has no persisted sessions')
+    async resume(_ownerCtx, options) {
+      const session = ctx.sessions.create(options.resumeSessionId, { meta: { cwd: '/tmp' } })
+      const agent = stubAgent(session)
+      const unregister = ctx.agents.register(agent)
+      return {
+        agent,
+        dispose: () => {
+          unregister()
+          return Promise.resolve()
+        },
+      }
     },
   }
   ctx.agents.setFactory(factory)
@@ -566,5 +596,254 @@ describe('Host Workspace increments', () => {
       error: { code: 'session-not-found', details: { sessionId: 'session-ghost' } },
     })
     abort.abort()
+  })
+})
+
+describe('workspace.deleteSession', () => {
+  it('deletes a persisted session, prunes its account and the archive set, and converges on rerun', async () => {
+    const stored: SessionHeader[] = []
+    const deleted: SessionId[] = []
+    const { api, ctx, root } = await harness(undefined, undefined, {
+      sessionPersistence: {
+        list: () => Promise.resolve(stored),
+        delete: async (id) => {
+          deleted.push(id)
+          stored.splice(0, stored.length, ...stored.filter(header => header.id !== id))
+        },
+      },
+    })
+    const workspace = expectOk(await api.workspace.create(request({ path: stageDir(root, 'delete-stored') }))).workspace
+    const persisted = {
+      version: 0,
+      id: SessionId('session-stored-to-delete'),
+      createdAt: 100,
+      cwd: workspace.path,
+    } satisfies SessionHeader
+    stored.push(persisted)
+    await ctx.workspaceRegistry.list()[0]!.attachSession(persisted.id)
+    expectOk(await api.workspace.archiveSession(request({ sessionId: persisted.id })))
+
+    expectOk(await api.workspace.deleteSession(request({ sessionId: persisted.id })))
+    expect(deleted).toEqual([persisted.id])
+    const listed = expectOk(await api.workspace.list(request({})))
+    expect(listed.items[0]?.sessionIds).toEqual([])
+    expect(listed.archivedSessionIds).toEqual([])
+
+    // Rerunning converges on the unknown identity: both the leak-proof
+    // session-not-found code and an untouched registry.
+    const rerun = await api.workspace.deleteSession(request({ sessionId: persisted.id }))
+    expect(rerun.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-not-found', details: { sessionId: persisted.id } },
+    })
+  })
+
+  it('tears down a live session through its retained handle and streams the pruned projections', async () => {
+    const deleted: SessionId[] = []
+    const { api, ctx, root } = await harness(undefined, undefined, {
+      sessionPersistence: {
+        list: () => Promise.resolve([]),
+        delete: async (id) => { deleted.push(id) },
+      },
+    })
+    const workspace = expectOk(await api.workspace.create(request({ path: stageDir(root, 'delete-live') }))).workspace
+    const sessionId = SessionId('session-live-to-delete')
+    expectOk(await api.sessions.create(request({ workspaceId: workspace.workspaceId, sessionId })))
+    expectOk(await api.workspace.archiveSession(request({ sessionId })))
+    expect(ctx.agents.get(sessionId)).toBeDefined()
+
+    const abort = new AbortController()
+    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+      api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
+    expectOk(await api.workspace.deleteSession(request({ sessionId })))
+    // Disposal comes first (no removal frame rides this stub's agent factory),
+    // then the registry commits the archive-set and account writes.
+    expect(ctx.agents.get(sessionId)).toBeUndefined()
+    expect(deleted).toEqual([sessionId])
+    const frames: HostFrame[] = []
+    frames.push((await nextHostFrame(stream)).payload)
+    while (!frames.some(frame => frame.type === 'host/workspace-changed')) {
+      frames.push((await nextHostFrame(stream)).payload)
+    }
+    expect(frames.find(frame => frame.type === 'host/session-removed')).toMatchObject({ sessionId })
+    expect(frames.find(frame => frame.type === 'host/archived-sessions-changed'))
+      .toMatchObject({ archivedSessionIds: [] })
+    expect(frames.find(frame => frame.type === 'host/workspace-changed')?.workspace.sessionIds)
+      .toEqual([])
+
+    const listed = expectOk(await api.workspace.list(request({})))
+    expect(listed.items[0]?.sessionIds).toEqual([])
+    expect(listed.archivedSessionIds).toEqual([])
+    abort.abort()
+  })
+
+  it('streams the removal frame for a cold session deletion from the persistence commit point', async () => {
+    const stored: SessionHeader[] = [{
+      version: 0,
+      id: SessionId('session-cold-to-delete'),
+      createdAt: 100,
+      cwd: '',
+    }]
+    const { api } = await harness(undefined, undefined, {
+      sessionPersistence: {
+        list: () => Promise.resolve(stored),
+        delete: async (id) => {
+          stored.splice(0, stored.length, ...stored.filter(header => header.id !== id))
+        },
+      },
+    })
+    const abort = new AbortController()
+    const stream: AsyncIterator<RpcRequest<HostFrame>> =
+      api.events.host(request({}), abort.signal)[Symbol.asyncIterator]()
+    const removed = nextHostFrame(stream)
+    expectOk(await api.workspace.deleteSession(request({ sessionId: SessionId('session-cold-to-delete') })))
+    expect(await removed).toMatchObject({
+      payload: { type: 'host/session-removed', sessionId: 'session-cold-to-delete' },
+    })
+    abort.abort()
+  })
+
+  it('refuses a parent whose live or persisted child sessions still exist', async () => {
+    const stored: SessionHeader[] = []
+    const { api, ctx, root } = await harness(undefined, undefined, {
+      sessionPersistence: { list: () => Promise.resolve(stored), delete: async () => {} },
+    })
+    stored.push({
+      version: 0,
+      id: SessionId('session-parent'),
+      createdAt: 100,
+      cwd: root,
+    })
+    ctx.sessions.create(SessionId('session-live-child'), {
+      meta: { cwd: root, parentSession: SessionId('session-parent') },
+    })
+    const liveChild = await api.workspace.deleteSession(request({ sessionId: SessionId('session-parent') }))
+    expect(liveChild.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-has-descendants', details: { children: ['session-live-child'] } },
+    })
+
+    stored.push(
+      {
+        version: 0,
+        id: SessionId('session-parent-2'),
+        createdAt: 100,
+        cwd: root,
+      },
+      {
+        version: 0,
+        id: SessionId('session-child-2'),
+        createdAt: 100,
+        cwd: root,
+        parentSession: SessionId('session-parent-2'),
+      },
+    )
+    const persistedChild = await api.workspace.deleteSession(request({ sessionId: SessionId('session-parent-2') }))
+    expect(persistedChild.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-has-descendants', details: { sessionId: 'session-parent-2', children: ['session-child-2'] } },
+    })
+  })
+
+  it('refuses a live subagent-owned session and leaves it attached', async () => {
+    const { api, ctx, root } = await harness()
+    const childId = SessionId('session-subagent-owned')
+    ctx.sessions.create(childId, { meta: { cwd: root, origin: 'subagent' } })
+    const response = await api.workspace.deleteSession(request({ sessionId: childId }))
+    expect(response.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-busy', details: { sessionId: childId } },
+    })
+    expect(ctx.sessions.get(childId)).toBeDefined()
+  })
+
+  it('refuses a live session the gateway never retained a teardown handle for', async () => {
+    const { api, ctx, root } = await harness()
+    const orphanId = SessionId('session-orphan-live')
+    ctx.sessions.create(orphanId, { meta: { cwd: root } })
+    const response = await api.workspace.deleteSession(request({ sessionId: orphanId }))
+    expect(response.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-busy', details: { sessionId: orphanId } },
+    })
+    expect(ctx.sessions.get(orphanId)).toBeDefined()
+  })
+
+  it('refuses a live session whose turn is running, and deletes it once idle', async () => {
+    const deleted: SessionId[] = []
+    const { api, ctx, root } = await harness(undefined, undefined, {
+      sessionPersistence: {
+        list: () => Promise.resolve([]),
+        delete: async (id) => { deleted.push(id) },
+      },
+    })
+    const workspace = expectOk(await api.workspace.create(request({ path: stageDir(root, 'running-home') }))).workspace
+    const sessionId = SessionId('session-running-task')
+    expectOk(await api.sessions.create(request({ workspaceId: workspace.workspaceId, sessionId })))
+    const agent = ctx.agents.get(sessionId)
+    if (agent === undefined) throw new Error('session agent missing')
+    ;(agent as unknown as { status: 'idle' | 'running' }).status = 'running'
+
+    // A running task is never killed by deletion: the request is refused and
+    // nothing was torn down or deleted.
+    const refused = await api.workspace.deleteSession(request({ sessionId }))
+    expect(refused.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-running', details: { sessionId } },
+    })
+    expect(ctx.agents.get(sessionId)).toBeDefined()
+    expect(ctx.sessions.get(sessionId)).toBeDefined()
+    expect(deleted).toEqual([])
+
+    // Once the turn settles, the same opened session deletes through its
+    // retained teardown.
+    ;(agent as unknown as { status: 'idle' | 'running' }).status = 'idle'
+    expectOk(await api.workspace.deleteSession(request({ sessionId })))
+    expect(ctx.agents.get(sessionId)).toBeUndefined()
+    expect(deleted).toEqual([sessionId])
+    expect(expectOk(await api.workspace.list(request({}))).items[0]?.sessionIds).toEqual([])
+  })
+
+  it('keeps one root-keyed teardown store for every gateway generation (HMR survival)', async () => {
+    const { ctx } = await harness()
+    // A hot-reloaded gateway resolves the same module-level store, so teardown
+    // capabilities retained by an earlier generation stay reachable — the
+    // property that keeps pre-reload opened sessions deletable.
+    expect(sessionHandleStore(ctx)).toBe(sessionHandleStore(ctx))
+    // Cross-application isolation: another root context owns its own store.
+    const foreign = new Context()
+    expect(sessionHandleStore(foreign)).not.toBe(sessionHandleStore(ctx))
+  })
+
+  it('retains teardown for a session the remote resolver resumes, and deletes it', async () => {
+    const stored: SessionHeader[] = [{
+      version: 0,
+      id: SessionId('session-resolver-resumed'),
+      createdAt: 100,
+      cwd: '/tmp',
+    }]
+    const deleted: SessionId[] = []
+    const { api, ctx } = await harness(undefined, undefined, {
+      sessionPersistence: {
+        list: () => Promise.resolve(stored),
+        delete: async (id) => { deleted.push(id) },
+        inspect: async () => ({ meta: stored[0]!, events: [] }),
+      },
+    })
+
+    // A generic entry point (prompt) resumes the cold identity through the
+    // shared remote resolver; the model refusal happens AFTER resume, so the
+    // session is live and its teardown retained regardless.
+    const sessionId = SessionId('session-resolver-resumed')
+    await api.sessions.prompt(request({
+      sessionId,
+      mode: 'queue',
+      content: [{ type: 'text', text: 'hi' }],
+    }))
+    expect(ctx.agents.get(sessionId)).toBeDefined()
+
+    expectOk(await api.workspace.deleteSession(request({ sessionId })))
+    expect(ctx.agents.get(sessionId)).toBeUndefined()
+    expect(deleted).toEqual([sessionId])
   })
 })

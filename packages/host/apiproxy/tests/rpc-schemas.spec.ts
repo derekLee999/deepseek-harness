@@ -22,7 +22,8 @@ import {
 import {
   workspaceArchiveSessionRequestSchema, workspaceArchiveSessionValueSchema,
   workspaceCreateRequestSchema, workspaceCreateValueSchema, workspaceIdSchema,
-  workspaceDeleteRequestSchema, workspaceDeleteValueSchema,
+  workspaceDeleteRequestSchema, workspaceDeleteSessionRequestSchema, workspaceDeleteSessionValueSchema,
+  workspaceDeleteValueSchema,
   workspaceInsertBeforeRequestSchema, workspaceInsertBeforeValueSchema,
   workspaceInsertSessionBeforeRequestSchema, workspaceInsertSessionBeforeValueSchema,
   workspaceListRequestSchema, workspaceListValueSchema,
@@ -366,6 +367,13 @@ describe('workspace domain schemas', () => {
     expect(workspaceArchiveSessionValueSchema.parse({ archivedSessionIds: ['s1', 's2'] }).archivedSessionIds)
       .toEqual(['s1', 's2'])
     expect(() => workspaceArchiveSessionValueSchema.parse({ archivedSessionIds: 's1' })).toThrow()
+  })
+
+  it('deleteSession request carries the id and the value confirms the deletion', () => {
+    expect(workspaceDeleteSessionRequestSchema.parse({ sessionId: 's1' }).sessionId).toBe('s1')
+    expect(() => workspaceDeleteSessionRequestSchema.parse({})).toThrow()
+    expect(workspaceDeleteSessionValueSchema.parse({ deleted: true })).toEqual({ deleted: true })
+    expect(() => workspaceDeleteSessionValueSchema.parse({ deleted: false })).toThrow()
   })
 
   it('insertSessionBefore accepts an anchored and an anchorless move', () => {

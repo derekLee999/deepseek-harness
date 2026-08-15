@@ -293,6 +293,23 @@ export class WorkspaceRuntime implements IWorkspaces {
   }
 
   /**
+   * Delete one session permanently. Deleting the current selection clears it
+   * immediately into the New Session view state (the host frame unmounts the
+   * removed row through the sessions list mirror; the clear also releases the
+   * staged scope instead of holding it behind the removed-row mask). Frames
+   * from another tab's delete arrive without this local call and fall back to
+   * the list mirror's masked-gap handling.
+   * @param sessionId - session to delete.
+   */
+  async deleteSession(sessionId: SessionId): Promise<void> {
+    const result = await this.manager.deleteSession(sessionId)
+    if (!result.ok) throw new Error(`session delete failed: ${result.error.code}: ${result.error.message}`)
+    if (this.sessions.list.getSnapshot().current === sessionId) {
+      this.sessions.clear()
+    }
+  }
+
+  /**
    * Move a session within its Workspace's manual order (DOM-insertBefore-like).
    * @param workspaceId - owning workspace.
    * @param sessionId - accounted session to move.

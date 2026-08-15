@@ -9,7 +9,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { readdirSync } from 'node:fs'
-import { open, mkdir, readFile, readdir, realpath, link, rm, stat, truncate } from 'node:fs/promises'
+import { open, mkdir, readFile, readdir, realpath, link, rm, rmdir, stat, truncate } from 'node:fs/promises'
 import { dirname, join, resolve } from 'node:path'
 import { performance } from 'node:perf_hooks'
 import { scheduler } from 'node:timers/promises'
@@ -197,6 +197,10 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
   // parses the stored prefix (both encodings) and skips forward to fromSeq.
   readFrom(id: SessionId, fromSeq: number, signal?: AbortSignal): Promise<{ meta: SessionHeader; events: SessionEvent[] }> {
     return this.coordinator.readFrom(id, fromSeq, signal)
+  }
+
+  delete(id: SessionId): Promise<void> {
+    return this.coordinator.delete(id)
   }
 
   // One method serves both public `list` and the backend hook; delegating it to
@@ -441,6 +445,43 @@ export class JsonlSessionPersistence extends SessionPersistence implements Persi
     if (tornMarker !== undefined) await this.repair(meta, tornMarker.truncateTo)
     const repairedEvents = [...(tornMarker?.recoveredEvents ?? []), ...closers]
     if (repairedEvents.length > 0) await this.appendLines(meta, repairedEvents)
+  }
+
+  /**
+   * Unlink a session's log in both physical encodings across every project
+   * directory, then remove the now-empty session directory when possible.
+   * Idempotent: absent files and directories resolve (the coordinator has
+   * already established the id is known). A session directory that still
+   * holds other entries is left in place — the durable artifact is gone
+   * either way, and only a backend-owned file ever lives there in practice.
+   * @param id - persisted session id whose artifact is deleted.
+   */
+  async deleteStored(id: SessionId): Promise<void> {
+    await this.ensureRootEncoding()
+    const projects = await this.listProjectDirs(undefined)
+    for (const project of projects) {
+      const dir = join(project, encodeSegment(id))
+      for (const name of ['session.jsonl', 'session.jsonl.zstd']) {
+        try {
+          await rm(join(dir, name), { force: true })
+        } catch (error) {
+          // Only absence of the parent directory is the "no such session
+          // here" case; every other unlink failure is a storage fault.
+          if (isENOENT(error)) continue
+          throw error
+        }
+      }
+      try {
+        await rmdir(dir)
+      } catch (error) {
+        // Swallows only the absence/non-empty outcomes: deletion is durable
+        // once the files are gone, and a leftover session directory carries no
+        // session data (`list` skips directories without a log file).
+        /* v8 ignore next 2 -- ENOTEMPTY is the collector for leftover entries; ENOENT a removed dir. */
+        if (isENOENT(error) || (error as NodeJS.ErrnoException | null)?.code === 'ENOTEMPTY') continue
+        throw error
+      }
+    }
   }
 
   /** List valid unique stored sessions' metadata (header line only — no full-log parse). */

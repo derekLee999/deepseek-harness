@@ -118,6 +118,10 @@ class MemoryPersistence extends SessionPersistence implements PersistenceBackend
     return this.coordinator.readFrom(id, fromSeq, signal)
   }
 
+  delete(id: SessionId): Promise<void> {
+    return this.coordinator.delete(id)
+  }
+
   // --- PersistenceBackend hooks (the Map storage primitives) ---
 
   // A Map-backed store has no torn tails, so `tornMarker` is never set.
@@ -159,6 +163,10 @@ class MemoryPersistence extends SessionPersistence implements PersistenceBackend
     /* v8 ignore next -- commitRepair only runs for a materialized (stored) session */
     if (!entry) return
     if (closers.length > 0) entry.events.push(...structuredClone(closers) as SessionEvent[])
+  }
+
+  async deleteStored(id: SessionId): Promise<void> {
+    this.store.delete(id)
   }
 
   async list(signal?: AbortSignal): Promise<SessionHeader[]> {
@@ -228,6 +236,10 @@ class ControlledBackend implements PersistenceBackend<never> {
     if (entry !== undefined) entry.events.push(...structuredClone(closers) as SessionEvent[])
   }
 
+  async deleteStored(id: SessionId): Promise<void> {
+    this.store.delete(id)
+  }
+
   async list(): Promise<SessionHeader[]> {
     return [...this.store.values()].map(entry => structuredClone(entry.meta))
   }
@@ -266,6 +278,103 @@ describe('the inherited readRaw default', () => {
     await expect(
       ctx.sessionPersistence.readRaw(SessionId('any-session'), controller.signal),
     ).rejects.toThrow('aborted')
+  })
+})
+
+describe('PersistenceCoordinator deletion orchestration', () => {
+  it('emits session-persistence/deleted after the durable artifact is gone', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(MemoryPersistence)
+    const deleted: SessionId[] = []
+    const off = ctx.on('session-persistence/deleted', id => deleted.push(id))
+    try {
+      const m = meta('deleted-event')
+      await ctx.sessionPersistence.create(m)
+      await ctx.sessionPersistence.append(m.id, oneTurnLog())
+      await ctx.sessionPersistence.delete(m.id)
+      expect(deleted).toEqual([m.id])
+      expect(await ctx.sessionPersistence.list()).toEqual([])
+    } finally {
+      off()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('contains a throwing deleted listener: the deletion stays committed', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(MemoryPersistence)
+    const warned: unknown[] = []
+    ctx.logger.warn = (...args: unknown[]) => { warned.push(args) }
+    const off = ctx.on('session-persistence/deleted', () => { throw new Error('observer boom') })
+    try {
+      const m = meta('deleted-listener-boom')
+      await ctx.sessionPersistence.create(m)
+      await ctx.sessionPersistence.append(m.id, oneTurnLog())
+      await expect(ctx.sessionPersistence.delete(m.id)).resolves.toBeUndefined()
+      await expect(ctx.sessionPersistence.load(m.id)).rejects.toThrow('not found')
+      expect(warned.length).toBe(1)
+    } finally {
+      off()
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects deleting a live session', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(MemoryPersistence)
+    const session = ctx.sessions.create(SessionId('deleted-live'))
+    try {
+      session.append('turn/start', { turn: 1 })
+      await ctx.sessions.flush(session)
+      await expect(ctx.sessionPersistence.delete(session.id)).rejects.toThrow('while it is live')
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('rejects deleting a session reserved for resume', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(MemoryPersistence)
+    const m = meta('deleted-reserved')
+    try {
+      await ctx.sessionPersistence.create(m)
+      await ctx.sessionPersistence.append(m.id, oneTurnLog())
+      const preparation = await ctx.sessionPersistence.prepare(m.id)
+      try {
+        await expect(ctx.sessionPersistence.delete(m.id))
+          .rejects.toThrow('reserved')
+      } finally {
+        preparation[Symbol.dispose]()
+      }
+      // The reservation is released, so the deletion now succeeds.
+      await expect(ctx.sessionPersistence.delete(m.id)).resolves.toBeUndefined()
+    } finally {
+      await ctx.fiber.dispose()
+    }
+  })
+
+  it('converges on crash rerun: a queued second delete finds the id unknown', async () => {
+    const ctx = new Context()
+    await ctx.plugin(SessionStore)
+    await ctx.plugin(MemoryPersistence)
+    try {
+      const m = meta('deleted-twice')
+      await ctx.sessionPersistence.create(m)
+      await ctx.sessionPersistence.append(m.id, oneTurnLog())
+      const settled = await Promise.allSettled([
+        ctx.sessionPersistence.delete(m.id),
+        ctx.sessionPersistence.delete(m.id),
+      ])
+      expect(settled.filter(result => result.status === 'fulfilled')).toHaveLength(1)
+      expect(settled.filter(result => result.status === 'rejected')).toHaveLength(1)
+      expect(await ctx.sessionPersistence.list()).toEqual([])
+    } finally {
+      await ctx.fiber.dispose()
+    }
   })
 })
 

@@ -83,6 +83,12 @@ class TracePersistence extends SessionPersistence {
     return { meta: whole.meta, events: whole.events.filter(event => event.seq >= fromSeq) }
   }
 
+  async delete(id: SessionIdType): Promise<void> {
+    if (!TracePersistence.entries.delete(id)) {
+      throw new Error('missing test session')
+    }
+  }
+
   list(): Promise<SessionHeader[]> {
     TracePersistence.listCalls += 1
     if (TracePersistence.listFailure !== undefined) return Promise.reject(TracePersistence.listFailure)

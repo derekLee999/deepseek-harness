@@ -428,5 +428,48 @@ export function runPersistenceContract(name: string, make: () => Promise<Contrac
         await dispose()
       }
     })
+
+    it('delete removes a persisted session for good: unknown afterwards, absent from list, id re-creatable', async () => {
+      const { persistence, dispose } = await make()
+      try {
+        const m = meta('deleted', '/work')
+        await persistence.create(m)
+        await persistence.append(m.id, oneTurnLog())
+        expect((await persistence.list()).map(header => header.id)).toContain(m.id)
+
+        await persistence.delete(m.id)
+        expect((await persistence.list()).map(header => header.id)).not.toContain(m.id)
+        expect((await persistence.listSnapshots()).map(snapshot => snapshot.header.id))
+          .not.toContain(m.id)
+        await expect(persistence.load(m.id)).rejects.toThrow('not found')
+        await expect(persistence.readFrom(m.id, 0)).rejects.toThrow('not found')
+        // A deleted id is unknown, so a crash rerun rejects rather than guessing.
+        await expect(persistence.delete(m.id)).rejects.toThrow('not found')
+
+        // A deleted id is a fresh identity: the same id can be created anew.
+        await persistence.create(meta('deleted', '/work'))
+        await persistence.append(m.id, oneTurnLog())
+        expect((await persistence.load(m.id)).events).toHaveLength(oneTurnLog().length)
+      } finally {
+        await dispose()
+      }
+    })
+
+    it('delete cancels an un-materialized create intent and frees the id', async () => {
+      const { persistence, dispose } = await make()
+      try {
+        await persistence.create(meta('intent'))
+        await persistence.delete(SessionId('intent'))
+        // After cancellation the id is unknown: a rerun rejects, and creation
+        // starts over from a clean slate.
+        await expect(persistence.delete(SessionId('intent'))).rejects.toThrow('not found')
+        await persistence.create(meta('intent'))
+        await persistence.append(SessionId('intent'), oneTurnLog())
+        expect((await persistence.load(SessionId('intent'))).events)
+          .toHaveLength(oneTurnLog().length)
+      } finally {
+        await dispose()
+      }
+    })
   })
 }

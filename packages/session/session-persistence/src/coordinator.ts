@@ -193,6 +193,17 @@ export interface PersistenceBackend<TornMarker = unknown> {
   commitRepair(meta: SessionHeader, tornMarker: TornMarker | undefined, closers: readonly SessionEvent[]): Promise<void>
 
   /**
+   * Permanently remove every durable artifact of one session id (the JSONL
+   * file in either physical encoding across storage scopes, the SQLite rows).
+   * Idempotent: resolving with nothing present is valid — the coordinator only
+   * calls this after establishing the id is known, and crash-rerun convergence
+   * relies on the idempotence. Runs on the id's serialized write chain, so no
+   * append for the same id is in flight.
+   * @param id - session whose stored log is deleted.
+   */
+  deleteStored(id: SessionId): Promise<void>
+
+  /**
    * List all stored (materialized) sessions' metadata.
    * @param signal - optional cancellation for backend listing work.
    */
@@ -836,6 +847,65 @@ export class PersistenceCoordinator<TornMarker = unknown> {
     const retired = Promise.resolve(this.retirements.get(id))
     const waited = signal === undefined ? retired : observeQueuedAbort(retired, signal, () => false)
     return waited.then(() => this.serialize(id, () => this.readFromCore(id, fromSeq, signal), signal))
+  }
+
+  /**
+   * Permanently delete one session's stored log. A retired live session's
+   * final drain is awaited before taking the chain slot, so its last batch is
+   * already durable (or its failure already reported) when the deletion runs;
+   * the slot itself then serializes against any remaining per-id work.
+   * @param id - persisted session to delete.
+   */
+  async delete(id: SessionId): Promise<void> {
+    await this.waitForRetirement(id)
+    await this.serialize(id, () => this.deleteCore(id))
+  }
+
+  /**
+   * The chain-owned deletion slot: refuse live or reserved identities, split
+   * the un-materialized create intent (memory-only cancellation) from stored
+   * logs (backend artifact removal), forget all in-memory state, and emit the
+   * deleted notification strictly after the durable removal.
+   * @param id - persisted session to delete.
+   */
+  private async deleteCore(id: SessionId): Promise<void> {
+    // A reserved unpublished Session must not lose its durable source
+    // mid-publication; the same guard append applies.
+    this.preparations.assertWritable(id)
+    const state = this.states.get(id)
+    let known = state !== undefined || this.preparations.has(id)
+    if (!known) known = await this.backend.loadStored(id) !== undefined
+    if (!known) throw new Error(`session "${id}" not found`)
+    for (const live of this.live.keys()) {
+      if (live.header.id === id) {
+        throw new Error(`cannot delete session "${id}" while it is live`)
+      }
+    }
+    this.states.delete(id)
+    this.preparations.invalidate(id)
+    if (state === undefined || state.materialized) {
+      await this.backend.deleteStored(id)
+    }
+    this.emitDeleted(id)
+  }
+
+  /**
+   * Dispatch the post-durability deletion notification, containing observer
+   * failures: the artifact is already gone, so a throwing listener must not
+   * retroactively reject the operation (the `domain/changed` containment
+   * posture).
+   * @param id - deleted session id.
+   */
+  private emitDeleted(id: SessionId): void {
+    try {
+      this.ctx.emit('session-persistence/deleted', id)
+    } catch (error) {
+      // Swallows synchronous observer exceptions only: emit dispatches
+      // listeners inline and nothing else runs in the try.
+      this.ctx.logger.warn(
+        `${this.backend.name}: session-persistence/deleted listener failed for "${id}": ${String(error)}`,
+      )
+    }
   }
 
   private async readFromCore(

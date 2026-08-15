@@ -213,6 +213,19 @@ insertBefore(id: WorkspaceId, beforeId?: WorkspaceId): Promise<readonly Workspac
 archiveSession(sessionId: SessionId): Promise<void>
 
 /**
+ * Prune one deleted session from the registry: drop its header and
+ * canonical-path index entries, remove its id from every workspace record's
+ * session account (the entity write prune also stamps `updatedAt` and emits
+ * the change), and drop it from the registry-global archive set. Existence
+ * was established by the caller — the session was deleted from storage —
+ * so unknown ids are an idempotent no-op for domain callers. Serialized on
+ * the registry operation chain, so a concurrent archive cannot re-add the
+ * id after the archive set is rewritten.
+ * @param sessionId - the deleted session id.
+ */
+deleteSession(sessionId: SessionId): Promise<void>
+
+/**
  * Resolve by canonical directory path without creating or mutating a
  * workspace. A missing path rejects during `realpath`; an existing unowned
  * directory returns `undefined`.

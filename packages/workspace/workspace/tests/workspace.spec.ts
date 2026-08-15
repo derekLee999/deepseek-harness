@@ -942,3 +942,39 @@ describe('registry-global session archive', () => {
     expect(upgraded.registry.archivedSessionIds).toEqual([])
   })
 })
+
+describe('deleted-session registry pruning', () => {
+  it('removes the session from its workspace account, the archive set, and the durable record', async () => {
+    const dir = await makeDir('delete-session-home')
+    const result = await harness({ sessions: [header('kept', dir, 100), header('gone', dir, 200)] })
+    const workspace = result.registry.list()[0]!
+    await result.registry.archiveSession(SessionId('gone'))
+
+    await result.registry.deleteSession(SessionId('gone'))
+    expect(workspace.sessionIds).toEqual([SessionId('kept')])
+    expect(result.registry.archivedSessionIds).toEqual([])
+    expect(storedState(result.pool).archivedSessionIds).toEqual([])
+    expect(storedRecord(result.pool, workspace.id).sessionIds).toEqual([SessionId('kept')])
+  })
+
+  it('is an idempotent no-op for an unknown session and emits no change', async () => {
+    const dir = await makeDir('delete-session-unknown')
+    const result = await harness({ sessions: [header('kept', dir, 100)] })
+    const changesBefore = result.changes.length
+
+    await expect(result.registry.deleteSession(SessionId('ghost'))).resolves.toBeUndefined()
+    expect(result.changes).toHaveLength(changesBefore)
+  })
+
+  it('refuses to re-archive a pruned session once storage no longer holds it', async () => {
+    const dir = await makeDir('delete-session-rearchive')
+    const result = await harness({ sessions: [header('gone', dir, 100)] })
+    await result.registry.deleteSession(SessionId('gone'))
+    // The real lifecycle deleted the stored log before pruning; mirror that
+    // with a fresh persistence listing that no longer carries the id.
+    result.setSessions([])
+    await expect(result.registry.archiveSession(SessionId('gone')))
+      .rejects.toThrow(/cannot archive session 'gone'/)
+    expect(result.registry.archivedSessionIds).toEqual([])
+  })
+})

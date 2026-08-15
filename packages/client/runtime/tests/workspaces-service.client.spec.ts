@@ -519,6 +519,38 @@ describe('WorkspaceRuntime', () => {
     await workspaces.refresh()
     expect(workspaces.list.getSnapshot().archivedSessionIds).toEqual([])
   })
+
+  it('deletes a session, clears only the current selection, and propagates host failures', async () => {
+    const ctx = new Context()
+    const api = new FakeApiClient()
+    const sessions = new SessionRuntime(ctx, api, fakeRemote())
+    const workspaces = new WorkspaceRuntime(ctx, api, sessions)
+    api.onList = () => Promise.resolve(ok({
+      items: [
+        { sessionId: sid('s-open'), updatedAt: 2, running: false, blank: false },
+        { sessionId: sid('s-idle'), updatedAt: 1, running: false, blank: false },
+      ],
+    }) as never)
+    await sessions.refresh()
+    sessions.open(sid('s-open'))
+
+    // Deleting a non-current session resolves without touching the selection.
+    await expect(workspaces.deleteSession(sid('s-idle'))).resolves.toBeUndefined()
+    expect(api.callsOf('workspace.deleteSession')).toEqual([{ sessionId: 's-idle' }])
+    expect(sessions.list.getSnapshot().current).toBe('s-open')
+
+    // Deleting the current session clears it into the New Session view state.
+    await workspaces.deleteSession(sid('s-open'))
+    expect(sessions.list.getSnapshot().current).toBeUndefined()
+
+    // A Host failure propagates as the structured surface error.
+    api.onWorkspaceDeleteSession = () => Promise.resolve(err({
+      code: 'session-has-descendants',
+      message: 'child sessions still exist',
+      details: { sessionId: sid('ghost'), children: [sid('s-child')] },
+    }))
+    await expect(workspaces.deleteSession(sid('ghost'))).rejects.toThrow(/session-has-descendants/)
+  })
 })
 
 describe('startInitialSelection', () => {

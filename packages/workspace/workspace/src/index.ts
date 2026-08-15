@@ -255,6 +255,38 @@ export class WorkspaceRegistry extends Service {
   }
 
   /**
+   * Prune one deleted session from the registry: drop its header and
+   * canonical-path index entries, remove its id from every workspace record's
+   * session account (the entity write prune also stamps `updatedAt` and emits
+   * the change), and drop it from the registry-global archive set. Existence
+   * was established by the caller — the session was deleted from storage —
+   * so unknown ids are an idempotent no-op for domain callers. Serialized on
+   * the registry operation chain, so a concurrent archive cannot re-add the
+   * id after the archive set is rewritten.
+   * @param sessionId - the deleted session id.
+   */
+  deleteSession(sessionId: SessionId): Promise<void> {
+    return this.enqueueOperation(async () => {
+      this.headers.delete(sessionId)
+      this.sessionPaths.delete(sessionId)
+      this.invalidSessionPaths.delete(sessionId)
+      let state = this.requireState()
+      if (state.archivedSessionIds.includes(sessionId)) {
+        state = {
+          ...state,
+          archivedSessionIds: state.archivedSessionIds.filter(id => id !== sessionId),
+        }
+        await this.setState(state)
+      }
+      for (const entity of this.entities.values()) {
+        const record = this.requireTable().get(entity.id) as WorkspaceRecord
+        if (!record.sessionIds.includes(sessionId)) continue
+        await entity.detachSession(sessionId)
+      }
+    })
+  }
+
+  /**
    * Whether a session is live, header-indexed, or present in a fresh
    * persistence listing. Only a definite miss returns false — a failing
    * `sessionPersistence.list()` propagates so storage faults never

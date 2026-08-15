@@ -21,6 +21,7 @@ function scriptedApi(overrides: {
   sessions?: Partial<ApiProxy['sessions']>
   subagents?: Partial<ApiProxy['subagents']>
   host?: Partial<ApiProxy['host']>
+  workspace?: Partial<ApiProxy['workspace']>
   skills?: Partial<ApiProxy['skills']>
   agentPresets?: Partial<ApiProxy['agentPresets']>
   events?: Partial<ApiProxy['events']>
@@ -88,6 +89,8 @@ function scriptedApi(overrides: {
       insertBefore: r => ok(r, { workspaceIds: [r.payload.workspaceId] }),
       insertSessionBefore: r => ok(r, { workspace: { workspaceId: 'w1' as never, path: '/t', title: 't', sessionIds: [], createdAt: '0', updatedAt: '0' } }),
       archiveSession: r => ok(r, { archivedSessionIds: [r.payload.sessionId] }),
+      deleteSession: r => ok(r, { deleted: true as const }),
+      ...overrides.workspace,
     },
     skills: { list: r => ok(r, { skills: [] }), ...overrides.skills },
     agentPresets: {
@@ -433,12 +436,66 @@ describe('workspace domain round trip', () => {
     if (created.result.ok) expect(created.result.value.created).toBe(true)
     const archivedResponse = await c.workspace.archiveSession({ sessionId: 's-arch' as never })
     expect(archivedResponse.result).toEqual({ ok: true, value: { archivedSessionIds: ['s-arch'] } })
+    const deletedResponse = await c.workspace.deleteSession({ sessionId: 's-gone' as never })
+    expect(deletedResponse.result).toEqual({ ok: true, value: { deleted: true } })
   })
 
   it('rejects a pathless create payload at the handler schema', async () => {
     const response = await client(scriptedApi()).workspace.create({} as never)
     expect(response.result.ok).toBe(false)
     if (!response.result.ok) expect(response.result.error.code).toBe('bad-request')
+  })
+
+  it('rejects a session-less deleteSession payload at the handler schema', async () => {
+    const response = await client(scriptedApi()).workspace.deleteSession({} as never)
+    expect(response.result.ok).toBe(false)
+    if (!response.result.ok) expect(response.result.error.code).toBe('bad-request')
+  })
+
+  it('parses the session-has-descendants error branch through the carrier value schema', async () => {
+    const api = scriptedApi({
+      workspace: {
+        deleteSession: r => Promise.resolve({
+          rpcId: r.rpcId,
+          result: {
+            ok: false,
+            error: {
+              code: 'session-has-descendants',
+              message: 'child sessions still exist',
+              details: { sessionId: 's-x', children: ['s-c'] },
+            },
+          },
+        }) as never,
+      },
+    })
+    const response = await client(api).workspace.deleteSession({ sessionId: 's-x' as never })
+    expect(response.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-has-descendants', details: { sessionId: 's-x', children: ['s-c'] } },
+    })
+  })
+
+  it('parses the session-running error branch through the carrier value schema', async () => {
+    const api = scriptedApi({
+      workspace: {
+        deleteSession: r => Promise.resolve({
+          rpcId: r.rpcId,
+          result: {
+            ok: false,
+            error: {
+              code: 'session-running',
+              message: 'it is running a task',
+              details: { sessionId: 's-x' },
+            },
+          },
+        }) as never,
+      },
+    })
+    const response = await client(api).workspace.deleteSession({ sessionId: 's-x' as never })
+    expect(response.result).toMatchObject({
+      ok: false,
+      error: { code: 'session-running', details: { sessionId: 's-x' } },
+    })
   })
 })
 

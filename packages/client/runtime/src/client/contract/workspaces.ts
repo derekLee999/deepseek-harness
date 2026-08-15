@@ -91,4 +91,12 @@ export interface IWorkspaces {
    * @param sessionId - session to archive.
    */
   archiveSession(sessionId: SessionId): Promise<void>
+  /**
+   * Permanently delete one session's stored log. A live session is torn down
+   * host-side first; the row, the workspace account, and the archive set
+   * update through the regular host frames. Deleting the current session
+   * clears the selection into the New Session view state.
+   * @param sessionId - session to delete.
+   */
+  deleteSession(sessionId: SessionId): Promise<void>
 }

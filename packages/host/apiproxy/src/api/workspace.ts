@@ -106,4 +106,20 @@ export interface WorkspaceApi {
    */
   archiveSession(request: RpcRequest<{ sessionId: SessionId }>):
   Promise<RpcResponse<{ archivedSessionIds: SessionId[] }>>
+
+  /**
+   * Permanently deletes one session's stored log and prunes it from the
+   * registry (workspace account and archive set). An idle live session is
+   * torn down first — its agent stops and the session detaches — so the
+   * deletion covers conversations currently open; a live session whose turn
+   * is running fails with `session-running` (wait or cancel first), and an
+   * activation-owned subagent session fails with `session-busy`. A session
+   * with forked or subagent descendants fails with `session-has-descendants`
+   * (only leaves are deletable). A session neither live nor in session
+   * persistence fails with `session-not-found`. Row and set removals reach
+   * clients through the regular host frames; the response carries no
+   * projection.
+   */
+  deleteSession(request: RpcRequest<{ sessionId: SessionId }>):
+  Promise<RpcResponse<{ deleted: true }>>
 }
